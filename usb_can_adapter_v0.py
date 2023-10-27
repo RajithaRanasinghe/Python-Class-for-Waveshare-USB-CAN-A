@@ -5,10 +5,18 @@ import argparse
 import signal
 import sys
 
+import traceback
+from typing import Dict, Union
+
+
 class UsbCanAdapter:
     # Constants
     CANUSB_INJECT_SLEEP_GAP_DEFAULT = 200  # ms
     CANUSB_TTY_BAUD_RATE_DEFAULT = 2000000
+    DATA_START_INDEX = 6
+    FRAME_ID_SLICE = slice(2, 6)
+    PGN_SLICE = slice(3, 5)
+
 
     # Enumerations
     CANUSB_SPEED = {
@@ -44,34 +52,10 @@ class UsbCanAdapter:
         'CANUSB_INJECT_PAYLOAD_MODE_FIXED': 2
     }
 
-    # Dictionary to map PGNs to their respective data descriptions
-    pgn_data_map = {
-        int('0xFF00', 16): ("Acceleration", ["Acc X", "Acc Y", "Acc Z", "App Flag Acc"]),
-        int('0xFF01', 16): ("Angular Rate", ["Gyro X", "Gyro Y", "Gyro Z", "App Flag Gyro"]),
-        int('0xFF02', 16): ("Rotational Acceleration", ["RotAcc X", "RotAcc Y", "RotAcc Z"]),
-        int('0xFF03', 16): ("Gravity Vector", ["Grav X", "Grav Y", "Grav Z"]),
-        int('0xFF04', 16): ("Linear Acceleration", ["LinAcc X", "LinAcc Y", "LinAcc Z"]),
-        int('0xFF05', 16): ("Angle", ["Roll", "Pitch", "Yaw", "Flag"]),
-        int('0xFF06', 16): ("Quaternion", ["Quat X", "Quat Y", "Quat Z", "Quat W"]),
-        int('0xFF07', 16): ("Mics", ["Temp Sens", "Temp Main"])
-    }
-
-    # Factor and offset definitions for each field
-    factors = {
-        "Acceleration": 1000,
-        "Angular Rate": 100,
-        "Rotational Acceleration": 1,
-        "Gravity Vector": 1000,
-        "Linear Acceleration" : 1000,
-        "Angle": 100,
-        "Quaternion": 1000,
-        "Mics": 10
-    }
-
-
     def __init__(self):
-        self.tty_device = None
-        self.baudrate = None
+        self.device_port = None
+        self.speed = None
+        self.baudrate = self.CANUSB_TTY_BAUD_RATE_DEFAULT
         self.terminate_after = 0
         self.program_running = True
         self.inject_payload_mode = self.CANUSB_PAYLOAD_MODE['CANUSB_INJECT_PAYLOAD_MODE_FIXED']
@@ -79,7 +63,9 @@ class UsbCanAdapter:
         self.print_traffic = False
         self.frame = bytearray()
         self.serial_device = None
-        self.data_dict = {"Roll": 0, "Pitch": 0, "Yaw": 0}
+        self.data_dict = {}
+
+
 
     @staticmethod
     def canusb_int_to_speed(speed):
@@ -104,8 +90,8 @@ class UsbCanAdapter:
         checksum = sum(data)
         return checksum & 0xff
 
-    def frame_send(self, tty_fd, frame):
-        if not tty_fd.is_open:
+    def frame_send(self, frame):
+        if not self.serial_device.is_open:
             print("Error: Serial port is not open.")
             return -1
 
@@ -121,7 +107,7 @@ class UsbCanAdapter:
             print()
 
         try:
-            result = tty_fd.write(bytes(frame))
+            result = self.serial_device.write(bytes(frame))
         except serial.SerialException as e:
             print(f"write() failed: {e}")
             return -1
@@ -129,8 +115,9 @@ class UsbCanAdapter:
         return frame_len
 
 
-    def frame_recv(self, tty_fd, frame_len_max):
-        if not tty_fd.is_open:
+    def frame_recv(self, frame_len_max = 20):
+
+        if not self.serial_device.is_open:
             print("Error: Serial port is not open.")
             return -1
 
@@ -143,7 +130,7 @@ class UsbCanAdapter:
 
         while self.program_running and frame_len < frame_len_max:
             try:
-                byte = tty_fd.read(1)
+                byte = self.serial_device.read(1)
             except serial.SerialException as e:
                 print(f"Error reading from serial port: {e}")
                 return -1
@@ -170,57 +157,66 @@ class UsbCanAdapter:
             print('')
         return frame_len
 
-    def command_settings(self, tty_fd, speed, mode, frame):
+    def command_settings(self, speed = None, mode = CANUSB_MODE["NORMAL"], frame= CANUSB_FRAME["STANDARD"]):
+        if speed != None:
+            self.speed = speed
+        self.frame = frame
+
         cmd_frame = bytearray()
 
         cmd_frame.append(0xaa)
         cmd_frame.append(0x55)
         cmd_frame.append(0x12)
-        cmd_frame.append(speed)
-        cmd_frame.append(frame)
+        cmd_frame.append(self.speed)
+        cmd_frame.append(self.frame)
         cmd_frame.extend([0] * 8)  # Fill with zeros for Filter ID and Mask ID (not handled)
         cmd_frame.append(mode)
         cmd_frame.extend([0x01, 0, 0, 0, 0])
         cmd_frame.append(self.generate_checksum(cmd_frame[2:19]))
 
-        if self.frame_send(tty_fd, cmd_frame) < 0:
+        if self.frame_send(cmd_frame) < 0:
             return -1
 
         return 0
 
-    def interpret_frame(self, frame):
-        # Extracting PGN and Source Address
-        pgn = frame[4] << 8 | frame[3]
-        pdo_name, fields = UsbCanAdapter.pgn_data_map.get(pgn, ("Unknown", []))
-        factor = UsbCanAdapter.factors.get(pdo_name, 1)
+    def extract_data(self, frame: bytearray) -> Dict[str, Union[bytearray, str]]:
+        """
+        Extracts the frame ID, PGN, node, and data bytes from a CAN frame.
 
-        # Converting to hex array
-        hex_string = ' '.join(f'{b:02x}' for b in frame)
-        bytes_list = hex_string.split()
+        Args:
+            frame (bytearray): A bytearray containing the CAN frame data.
 
+        Returns:
+            dict: A dictionary containing the following keys:
+                * frame_id: The frame ID (4 bytes) as a string.
+                * pgn: The parameter group number (2 bytes) as a string.
+                * node: The node ID (1 byte) as a string.
+                * data: A bytearray containing the data bytes.
+        """
         try:
-            # Start extracting from the 7th byte (index 6) onward
-            byte_index = 6
-            for field in fields:
-                # Assuming each field requires 2 bytes
-                hex_val = bytes_list[byte_index+1] + bytes_list[byte_index]
-                int_val = int(hex_val, 16)
+            frame_id_bytes = frame[self.FRAME_ID_SLICE][::-1]
+            pgn_bytes = frame[self.PGN_SLICE][::-1]
+            node_byte = frame[2]
 
-                # Convert 2's complement hex to signed integer
-                if int_val >= 2**15:
-                    int_val -= 2**16
+            frame_id = frame_id_bytes.hex()
+            pgn = pgn_bytes.hex()
+            node = f"{node_byte:02x}"
 
-                # Store the converted and scaled value in the data dictionary
-                self.data_dict[field] = int_val / factor
+            # Use slicing to extract data bytes and reverse the order of every adjacent pair of bytes
+            data_bytes = bytearray()
+            for i in range(self.DATA_START_INDEX, len(frame), 2):
+                data_bytes.extend(frame[i+1:i-1:-1])
 
-                byte_index += 2
-        except:
-            pass
-        return {"PDO Name": pdo_name, "Data": self.data_dict}
+        except IndexError as e:
+            error_message = (f"Error in CAN data frame\nException: {e}\nTraceback:\n{traceback.format_exc()}")
+            print(error_message)
 
-    def dump_data_frames(self, tty_fd, print_flag):
+        return {"frame_id": frame_id, "pgn": pgn, "node": node, "data": data_bytes}
+
+
+    def dump_data_frames(self, print_flag):
         while self.program_running:
-            frame_len = self.frame_recv(tty_fd, 32)
+            frame_len = self.frame_recv(20)
 
             if not self.program_running:
                 break
@@ -228,31 +224,27 @@ class UsbCanAdapter:
             if frame_len == -1:
                 print("Frame receive error!")
             else:
-                self.interpret_frame(self.frame)
+                self.data_dict = self.extract_data(self.frame)
 
             if print_flag:
                 try:
-                    print("Roll: {} Pitch: {} Yaw: {}".format(self.data_dict["Roll"], self.data_dict["Pitch"], self.data_dict["Yaw"]), end="\n")
+                    print(f"{self.data_dict}")
                 except KeyError:
                     pass
         return 0
 
-    def imu_f99xB20_init(self, port="/dev/ttyUSB0", baudrate=250000, print_flag=False):
-        print(f'port = {port} sensor speed = {baudrate}')
-        self.tty_device = port
-        self.baudrate = self.CANUSB_TTY_BAUD_RATE_DEFAULT
-        speed = self.canusb_int_to_speed(baudrate)
-        tty_fd = self.adapter_init(self.tty_device, self.baudrate)
-        self.command_settings(tty_fd, speed, self.CANUSB_MODE["NORMAL"], self.CANUSB_FRAME["STANDARD"])
-        self.dump_data_frames(tty_fd, print_flag)
-        return self.data_dict
 
-    def adapter_init(self, tty_device, baudrate):
+
+    def adapter_init(self, device_port=None, baudrate=None):
+        if device_port != None:
+            self.device_port = device_port
+        if baudrate != None:
+            self.baudrate = baudrate
         try:
-            self.serial_device = serial.Serial(tty_device, baudrate=baudrate, bytesize=serial.EIGHTBITS, parity=serial.PARITY_NONE, stopbits=serial.STOPBITS_TWO, timeout=None)
+            self.serial_device = serial.Serial(self.device_port, baudrate=self.baudrate, bytesize=serial.EIGHTBITS, parity=serial.PARITY_NONE, stopbits=serial.STOPBITS_TWO, timeout=None)
             return self.serial_device
         except serial.SerialException as e:
-            print("Error opening serial port {}: {}".format(tty_device, e))
+            print("Error opening serial port {}: {}".format(device_port, e))
             return None
 
     def adapter_close(self):
@@ -298,7 +290,7 @@ class UsbCanAdapter:
 
         return bin_string
 
-    def inject_data_frame(self, tty_fd, hex_id, hex_data):
+    def inject_data_frame(self, hex_id, hex_data):
         binary_data = bytearray(8)
         binary_id_lsb = 0
         binary_id_msb = 0
@@ -382,7 +374,7 @@ class UsbCanAdapter:
             sys.exit(0)
 
         if args.t:
-            print_traffic += 1
+            self.print_traffic = True
 
         tty_device = args.d
         speed = self.canusb_int_to_speed(args.s) if args.s else 0
@@ -400,7 +392,7 @@ class UsbCanAdapter:
             inject_payload_mode = args.m
 
         signal.signal(signal.SIGTERM, self.sigterm)
-        signal.signal(signal.SIGHUP, self.sigterm)
+        #signal.signal(signal.SIGHUP, self.sigterm)
         signal.signal(signal.SIGINT, self.sigterm)
 
         if not tty_device:
@@ -413,29 +405,38 @@ class UsbCanAdapter:
             self.display_help()
             sys.exit(1)
 
-        tty_fd = self.adapter_init(tty_device, baudrate)
-        if tty_fd is None:
+        self.adapter_init(tty_device, baudrate)
+        if self.serial_device is None:
             sys.exit(1)
 
-        self.command_settings(tty_fd, speed, self.CANUSB_MODE["NORMAL"], self.CANUSB_FRAME["STANDARD"])
+        self.command_settings(speed, self.CANUSB_MODE["NORMAL"], self.CANUSB_FRAME["STANDARD"])
 
         if inject_data is None:
             # Dumping mode (default).
-            self.dump_data_frames(tty_fd, True)
+            self.dump_data_frames(print_flag =True)
         else:
             # Inject mode.
             if inject_id is None:
                 print("Please specify a ID for injection!")
                 self.display_help()
                 sys.exit(1)
-            if self.inject_data_frame(tty_fd, inject_id, inject_data) == -1:
+            if self.inject_data_frame(inject_id, inject_data) == -1:
                 sys.exit(1)
             else:
                 sys.exit(0)
 
         sys.exit(0)
 
+    def set_can_baudrate(self, baudrate):
+        self.speed = self.canusb_int_to_speed(baudrate)
+
+    def set_port(self, port):
+        self.device_port = port
+
+
 if __name__ == "__main__":
     uca = UsbCanAdapter()
     uca.main()
+
+
 

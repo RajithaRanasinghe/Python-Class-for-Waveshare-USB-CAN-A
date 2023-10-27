@@ -68,6 +68,8 @@ python usb_can_adapter_md.py -d "COM4" -s 250000
 ```
 In this example, the script will use the COM4 device with a CAN speed of 250,000 bps.
 
+![Terminal output](/results/TerminalOut.png)
+
 # Test with Pepperl Fuchs IMUF99PL-SC3600-0KB20V1501 Sensor
 The following code snippet demonstrates how to use the **UsbCanAdapter** and **IMUIf99xB20nterpreter** classes to read data from the Pepperl Fuchs IMUF99PL-SC3600-0KB20V1501 sensor.
 
@@ -100,3 +102,5 @@ if __name__ == "__main__":
             pass # Sometimes the frame does not have data
 
 ```
+
+![Test output](/results/Test_IMUF99PL.png)

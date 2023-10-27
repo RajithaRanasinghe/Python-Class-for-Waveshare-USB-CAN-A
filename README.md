@@ -64,7 +64,7 @@ The IMUIf99xB20nterpreter class is used for interpreting data from the Pepperl F
 The script can be run directly from the command line, with options for specifying the TTY device, CAN speed, baud rate, and other parameters.
 
 ```bash
-python usb_can_adapter_md.py -d "COM4" -s 250000
+python usb_can_adapter_v1.py -d "COM4" -s 250000
 ```
 In this example, the script will use the COM4 device with a CAN speed of 250,000 bps.
 
